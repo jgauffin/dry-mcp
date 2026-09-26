@@ -27,6 +27,13 @@ export interface ModelSettings {
 export interface DuplicationConfig {
   include: string[];
   exclude: string[];
+  /**
+   * Whether to analyse directories that are repositories of their own — git
+   * submodules and vendored clones. Off, because that is another project's code:
+   * duplication found inside it cannot be fixed from here, and on a first run in
+   * a repository with submodules it is most of what gets reported.
+   */
+  includeNestedRepositories: boolean;
   /** Blocks shorter than this are never worth reporting. */
   minLines: number;
   /** How alike two blocks must be to count as the same code. */
@@ -46,6 +53,7 @@ export const DEFAULT_CONFIG: DuplicationConfig = {
     '**/*.generated.*',
     '**/migrations/**',
   ],
+  includeNestedRepositories: false,
   minLines: 6,
   /**
    * Measured against the model rather than guessed. Code that is the same
@@ -69,7 +77,8 @@ export const DEFAULT_CONFIG: DuplicationConfig = {
   },
 };
 
-const CONFIG_FILE_NAME = 'duplication.config.json';
+/** The file a team writes its scope and thresholds into, in the project root. */
+export const CONFIG_FILE_NAME = 'duplication.config.json';
 
 /**
  * Reads the project's settings, falling back to defaults for anything the team
@@ -119,6 +128,8 @@ export function mergeWithDefaults(parsed: Partial<DuplicationConfig>): Duplicati
   return {
     include: parsed.include ?? DEFAULT_CONFIG.include,
     exclude: parsed.exclude ?? DEFAULT_CONFIG.exclude,
+    includeNestedRepositories:
+      parsed.includeNestedRepositories ?? DEFAULT_CONFIG.includeNestedRepositories,
     minLines: parsed.minLines ?? DEFAULT_CONFIG.minLines,
     similarityThreshold: parsed.similarityThreshold ?? DEFAULT_CONFIG.similarityThreshold,
     idiom: { ...DEFAULT_CONFIG.idiom, ...(parsed.idiom ?? {}) },

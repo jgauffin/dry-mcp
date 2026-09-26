@@ -84,6 +84,15 @@ whitelist — name the paths to analyse and **everything else is ignored**:
 you can whitelist a tree and still drop generated files inside it. Other
 defaults are calibrated and worth leaving alone.
 
+Git submodules and vendored clones are left out: they are other projects, and
+duplication inside them cannot be fixed from here. Set
+`"includeNestedRepositories": true` if you own them too.
+
+Edits take effect on the next question, so an agent can write this file itself.
+Until it exists, every source file under the root is in scope — which is what
+the replies say, along with the largest folders, when the project is big enough
+for that to matter.
+
 ---
 
 [How it works](docs/design.md)

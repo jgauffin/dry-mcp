@@ -7,9 +7,12 @@ import {
   type Confidence,
   type DuplicationCluster,
   type Embedding,
+  type FolderSize,
+  type IndexProgress,
   type IndexStatus,
+  type ScopeSummary,
 } from '../types.js';
-import { readConfigFile, type DuplicationConfig } from '../config.js';
+import { CONFIG_FILE_NAME, readConfigFile, type DuplicationConfig } from '../config.js';
 import { Chunker } from '../chunking/chunker.js';
 import { Clusterer } from './clusterer.js';
 import { IdiomFilter } from './idiom-filter.js';
@@ -43,6 +46,28 @@ const SKIP_DIRECTORIES = ['node_modules', 'dist', 'build', 'coverage', 'bin', 'o
 /** The largest file worth reading, so one generated blob cannot stall a scan. */
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
+/**
+ * A project of at most this many files is embedded in well under a minute, so
+ * there is no early answer worth distinguishing from a complete one: it is
+ * analysed as it stands and the queue count says the rest.
+ */
+const SMALL_PROJECT_FILES = 200;
+
+/**
+ * How much of a larger project must be embedded before findings are reported at
+ * all.
+ *
+ * A ranking drawn from a fifth of a codebase is not an early version of the real
+ * answer, it is a different answer: the worst duplication is most likely in the
+ * part not yet read, and the ranking invites acting on whatever happens to be
+ * indexed first. Below this share the reply carries progress instead, which
+ * costs nothing and is honest about what is known.
+ */
+const USEFUL_INDEX_PERCENT = 50;
+
+/** How many folders and skipped repositories a reply names before summarising. */
+const MAX_PATHS_LISTED = 8;
+
 export interface DuplicationQuery {
   topN?: number;
   minLines?: number;
@@ -71,10 +96,23 @@ interface OccurrenceSource {
   text: string;
 }
 
+/** What one walk of the project learned, kept so a reply can describe the scope. */
+interface ScanTally {
+  scans: FileScan[];
+  /** Files per top-level folder, for naming the biggest contributors. */
+  filesByFolder: Map<string, number>;
+  /** Directories that are repositories of their own and were left out. */
+  nestedRepositories: string[];
+}
+
 export interface DuplicationReport {
   status: IndexStatus;
   /** Present only when the answer is limited or incomplete, so a clean run stays quiet. */
   notice?: string;
+  /** Present while the index is incomplete, so an early answer can be judged. */
+  progress?: IndexProgress;
+  /** Present when the scope looks wider than intended, with what to do about it. */
+  scope?: ScopeSummary;
   analysisMode: 'heuristic';
   /**
    * What each confidence level means. Travels with the results so a caller can
@@ -114,6 +152,8 @@ export class DuplicationService {
   private reported = new ReportedFindings();
   /** What the config file said last time it was read, to notice a rewrite. */
   private configFingerprint: string;
+  /** What the most recent walk found, so describing the scope costs no extra walk. */
+  private lastScan: ScanTally | null = null;
 
   constructor(
     projectRoot: string,
@@ -253,6 +293,9 @@ export class DuplicationService {
       };
     }
 
+    const progress = this.progress(status);
+    if (this.tooEarlyToRank(progress)) return this.progressReport(status, progress);
+
     const blocks = this.readProject(query.minLines);
     const vectors = this.vectorsFor(blocks.chunks);
     const judged = this.idiomFilter.apply(
@@ -287,8 +330,12 @@ export class DuplicationService {
       },
     };
 
-    const notice = this.noticeFor(status, suppressed.length);
+    const notice = this.noticeFor(progress, suppressed.length);
     if (notice) report.notice = notice;
+    if (progress.pendingFiles > 0) report.progress = progress;
+
+    const scope = this.scopeWorthReporting(progress);
+    if (scope) report.scope = scope;
     if (query.includeSuppressed) report.suppressedIdioms = rankBySeverity(suppressed);
 
     // Only what this answer hands out: an id a caller never saw is not one they
@@ -389,13 +436,15 @@ export class DuplicationService {
    * Explains anything that limits how much the answer can be trusted: work
    * still queued, or findings hidden behind the idiom rules.
    */
-  private noticeFor(status: IndexStatus, suppressedCount: number): string | undefined {
+  private noticeFor(progress: IndexProgress, suppressedCount: number): string | undefined {
     const parts: string[] = [];
 
-    if (status.pendingFiles > 0) {
+    if (progress.pendingFiles > 0) {
       parts.push(
-        `${status.pendingFiles} file(s) are queued for embedding, so recent changes may ` +
-          `not be reflected yet. Ask again shortly for a complete picture.`
+        `${progress.pendingFiles} file(s) are queued for embedding — ` +
+          `${progress.percentComplete}% of ${progress.filesInScope} file(s) in scope are ` +
+          `indexed — so this answer may not cover all of the project. Ask again shortly ` +
+          `for a complete picture; embedding continues in the background either way.`
       );
     }
 
@@ -406,7 +455,151 @@ export class DuplicationService {
       );
     }
 
+    const scopeNotice = this.scopeNotice(progress);
+    if (scopeNotice) parts.push(scopeNotice);
+
     return parts.length > 0 ? parts.join(' ') : undefined;
+  }
+
+  /** How far the index has got, which every incomplete answer carries. */
+  progress(status: IndexStatus = this.status()): IndexProgress {
+    // The walk knows the scope exactly; before one has run, what the cache has a
+    // record of is the best available answer.
+    const filesInScope = this.lastScan?.scans.length ?? status.filesIndexed;
+    const embedded = Math.max(0, filesInScope - status.pendingFiles);
+
+    return {
+      filesInScope,
+      filesEmbedded: embedded,
+      pendingFiles: status.pendingFiles,
+      percentComplete: filesInScope === 0 ? 100 : Math.floor((embedded / filesInScope) * 100),
+    };
+  }
+
+  /**
+   * Whether ranking the project now would say more about indexing order than
+   * about the code. Small projects are always ranked: they finish before anyone
+   * could ask twice.
+   */
+  private tooEarlyToRank(progress: IndexProgress): boolean {
+    if (progress.pendingFiles === 0) return false;
+    if (progress.filesInScope < SMALL_PROJECT_FILES) return false;
+    return progress.percentComplete < USEFUL_INDEX_PERCENT;
+  }
+
+  /** Progress in place of findings, for a project still too thinly indexed to rank. */
+  private progressReport(status: IndexStatus, progress: IndexProgress): DuplicationReport {
+    const parts = [
+      `Indexing this project: ${progress.percentComplete}% done ` +
+        `(${progress.filesEmbedded} of ${progress.filesInScope} file(s) embedded, ` +
+        `${progress.pendingFiles} queued). No findings yet — a ranking drawn from ` +
+        `${progress.percentComplete}% of the code would mostly reflect which files were ` +
+        `read first. Embedding runs in the background; ask again shortly, or call ` +
+        `duplication_status to watch the queue.`,
+    ];
+
+    const scopeNotice = this.scopeNotice(progress);
+    if (scopeNotice) parts.push(scopeNotice);
+
+    const report: DuplicationReport = {
+      status,
+      notice: parts.join(' '),
+      progress,
+      analysisMode: 'heuristic',
+      confidenceGuide: CONFIDENCE_GUIDE,
+      duplications: [],
+      summary: {
+        clustersFound: 0,
+        totalRemovableLines: 0,
+        filesInvolved: 0,
+        byConfidence: {},
+      },
+    };
+
+    const scope = this.scopeWorthReporting(progress);
+    if (scope) report.scope = scope;
+
+    return report;
+  }
+
+  /** What is in scope, described whenever the answer may be covering too much. */
+  scopeSummary(filesInScope = this.progress().filesInScope): ScopeSummary {
+    const summary: ScopeSummary = {
+      filesInScope,
+      configFile: CONFIG_FILE_NAME,
+      configured: this.hasConfigFile(),
+      largestFolders: this.largestFolders(),
+    };
+
+    const nested = this.lastScan?.nestedRepositories ?? [];
+    if (nested.length > 0) summary.skippedNestedRepositories = nested;
+
+    return summary;
+  }
+
+  /**
+   * The scope, but only when something about it needs attention: nothing was
+   * narrowed and the project is large, or whole repositories were left out. A
+   * team that has written its rules down does not need them read back.
+   */
+  private scopeWorthReporting(progress: IndexProgress): ScopeSummary | undefined {
+    if (!this.scopeNeedsAttention(progress)) return undefined;
+    return this.scopeSummary(progress.filesInScope);
+  }
+
+  private scopeNeedsAttention(progress: IndexProgress): boolean {
+    if ((this.lastScan?.nestedRepositories.length ?? 0) > 0) return true;
+    return !this.hasConfigFile() && progress.filesInScope >= SMALL_PROJECT_FILES;
+  }
+
+  /**
+   * What to tell a caller that can narrow the scope itself.
+   *
+   * The config file is plain JSON in the project root, so the calling agent can
+   * write it without help, and the rules are re-read before the next question —
+   * which is why this says what to write rather than who to ask.
+   */
+  private scopeNotice(progress: IndexProgress): string | undefined {
+    if (!this.scopeNeedsAttention(progress)) return undefined;
+
+    const parts: string[] = [];
+    const nested = this.lastScan?.nestedRepositories ?? [];
+
+    if (nested.length > 0) {
+      parts.push(
+        `${nested.length} nested repository/ies are left out, being other projects' code ` +
+          `(submodule or vendored clone): ${listPaths(nested)}. Set ` +
+          `"includeNestedRepositories": true in ${CONFIG_FILE_NAME} to analyse them too.`
+      );
+    }
+
+    if (!this.hasConfigFile() && progress.filesInScope >= SMALL_PROJECT_FILES) {
+      parts.push(
+        `There is no ${CONFIG_FILE_NAME} in the project root, so every source file under ` +
+          `it is in scope (${progress.filesInScope} files; largest folders: ` +
+          `${describeFolders(this.largestFolders())}). If any of that is not code this team ` +
+          `maintains, write the file yourself — ` +
+          `{"exclude": ["vendor/**", "**/*.generated.*"], "include": ["src/**"]} — using ` +
+          `globs on project-relative paths with forward slashes, where exclude wins over ` +
+          `include. The next call picks the edit up; nothing needs restarting.`
+      );
+    }
+
+    return parts.length > 0 ? parts.join(' ') : undefined;
+  }
+
+  private largestFolders(): FolderSize[] {
+    const sizes: FolderSize[] = [];
+    for (const [folder, files] of this.lastScan?.filesByFolder ?? []) {
+      sizes.push({ folder, files });
+    }
+
+    sizes.sort((first, second) => second.files - first.files);
+    return sizes.slice(0, MAX_PATHS_LISTED);
+  }
+
+  private hasConfigFile(): boolean {
+    return fs.existsSync(path.join(this.projectRoot, CONFIG_FILE_NAME));
   }
 
   /**
@@ -503,12 +696,13 @@ export class DuplicationService {
    * before every question on a project of any size.
    */
   private listProject(): FileScan[] {
-    const scans: FileScan[] = [];
-    this.walk(this.projectRoot, scans);
-    return scans;
+    const tally: ScanTally = { scans: [], filesByFolder: new Map(), nestedRepositories: [] };
+    this.walk(this.projectRoot, tally);
+    this.lastScan = tally;
+    return tally.scans;
   }
 
-  private walk(directory: string, collected: FileScan[]): void {
+  private walk(directory: string, tally: ScanTally): void {
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(directory, { withFileTypes: true });
@@ -530,7 +724,15 @@ export class DuplicationService {
           continue;
         }
 
-        this.walk(full, collected);
+        // A submodule or a vendored clone is another project's code. Reported
+        // rather than silently dropped, because a team that does own the
+        // submodule needs to see why its code never appears.
+        if (!this.config.includeNestedRepositories && isRepositoryRoot(full)) {
+          tally.nestedRepositories.push(relativeDirectory);
+          continue;
+        }
+
+        this.walk(full, tally);
         continue;
       }
 
@@ -541,7 +743,9 @@ export class DuplicationService {
 
       try {
         const stats = fs.statSync(full);
-        collected.push({ file: relative, mtime: stats.mtimeMs, size: stats.size });
+        tally.scans.push({ file: relative, mtime: stats.mtimeMs, size: stats.size });
+        const folder = topFolderOf(relative);
+        tally.filesByFolder.set(folder, (tally.filesByFolder.get(folder) ?? 0) + 1);
       } catch {
         // An unreadable file is skipped rather than failing the whole scan.
       }
@@ -610,10 +814,44 @@ function scopeFingerprintOf(config: DuplicationConfig): string {
   return JSON.stringify({
     include: config.include,
     exclude: config.exclude,
+    includeNestedRepositories: config.includeNestedRepositories,
     minLines: config.minLines,
     similarityThreshold: config.similarityThreshold,
     idiom: config.idiom,
   });
+}
+
+/**
+ * Whether a directory is a repository in its own right.
+ *
+ * A submodule's `.git` is a file pointing at the parent's storage and a plain
+ * clone's is a directory; either way its presence is what marks the boundary
+ * between this project and somebody else's.
+ */
+function isRepositoryRoot(directory: string): boolean {
+  return fs.existsSync(path.join(directory, '.git'));
+}
+
+/** The folder a file belongs to for reporting, or "." for the project root. */
+function topFolderOf(relativeFile: string): string {
+  const slash = relativeFile.indexOf('/');
+  return slash === -1 ? '.' : relativeFile.substring(0, slash);
+}
+
+/** Paths for a notice, capped so one reply cannot list a thousand of them. */
+function listPaths(paths: string[]): string {
+  if (paths.length <= MAX_PATHS_LISTED) return paths.join(', ');
+
+  const shown = paths.slice(0, MAX_PATHS_LISTED).join(', ');
+  return `${shown} and ${paths.length - MAX_PATHS_LISTED} more`;
+}
+
+function describeFolders(folders: FolderSize[]): string {
+  const described: string[] = [];
+  for (const folder of folders) {
+    described.push(`${folder.folder} (${folder.files})`);
+  }
+  return described.join(', ');
 }
 
 /** Confidence from least to most sure, for comparing one level against another. */

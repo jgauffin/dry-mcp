@@ -40,17 +40,24 @@ export const duplicationTools: ToolModule = {
         'positives at low and moderate, and read the code before acting on those; findings ' +
         'marked certain or high rarely need checking. Narrow with minConfidence or raise ' +
         'similarityThreshold when you want fewer, safer results.\n\n' +
-        'Always reports how many files are still queued for embedding, so a partial answer ' +
-        'is recognisable as one. Block boundaries are inferred without a parser, so treat ' +
-        'line ranges as approximate and read the returned source for the real extent.',
+        'Never waits for indexing. Embedding a large project takes minutes, so the reply ' +
+        'carries a "progress" block (files in scope, files embedded, percent complete) ' +
+        'whenever the index is incomplete; until half a large project is embedded it ' +
+        'reports progress alone rather than a ranking that would mostly reflect which ' +
+        'files were read first. Ask again shortly, or watch duplication_status.\n\n' +
+        'When the scope looks wider than intended the reply also carries a "scope" block ' +
+        'and says how to narrow it by editing duplication.config.json in the project root.\n\n' +
+        'Block boundaries are inferred without a parser, so treat line ranges as ' +
+        'approximate and read the returned source for the real extent.',
       inputSchema: TOOL_SCHEMAS.detectDuplication,
     },
     {
       name: 'duplication_status',
       description:
-        'Report how ready the analysis is: files indexed, blocks cached, files still queued ' +
-        'for embedding, and whether the embedding model is installed. Cheap — use it to ' +
-        'check readiness without running an analysis.',
+        'Report how ready the analysis is: indexing progress, blocks cached, whether the ' +
+        'embedding model is installed, and what is in scope — the file count, the largest ' +
+        'folders, and any nested repositories left out. Cheap — use it to follow indexing, ' +
+        'or to see what would be analysed before narrowing the scope.',
       inputSchema: TOOL_SCHEMAS.duplicationStatus,
     },
     {
@@ -89,8 +96,11 @@ export const duplicationTools: ToolModule = {
 
     duplication_status: (_args, service) => {
       const status = service.status();
+      const progress = service.progress(status);
       return {
         ...status,
+        progress,
+        scope: service.scopeSummary(progress.filesInScope),
         ready: status.modelStatus === 'ready' && status.pendingFiles === 0,
         analysisMode: 'heuristic',
       };
@@ -122,11 +132,15 @@ export const duplicationTools: ToolModule = {
       }
 
       const status = service.status();
+      const progress = service.progress(status);
       return {
         status,
+        progress,
         notice:
           status.pendingFiles > 0
-            ? `Rebuilding: ${status.pendingFiles} file(s) queued for embedding.`
+            ? `Rebuilding: ${progress.percentComplete}% done, ${status.pendingFiles} file(s) ` +
+              `queued for embedding. It continues in the background; follow it with ` +
+              `duplication_status.`
             : 'Rebuild complete.',
       };
     },

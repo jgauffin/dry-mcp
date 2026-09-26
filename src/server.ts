@@ -11,7 +11,7 @@ import { ToolHandler, TOOL_DEFINITIONS } from './tools/index.js';
 import { DuplicationService } from './analysis/duplication-service.js';
 import { EmbeddingCache } from './cache/embedding-cache.js';
 import { ModelStore } from './embedding/model-store.js';
-import { loadConfig } from './config.js';
+import { CONFIG_FILE_NAME, loadConfig } from './config.js';
 import { normalizePath } from './paths.js';
 import { GitState } from './tools/git-state.js';
 
@@ -108,9 +108,21 @@ function instructionsFor(root: string, modelStore: ModelStore): string {
     ``,
     `All file paths are relative to the project root, using forward slashes.`,
     ``,
-    `Embedding happens in the background. Every answer reports "pendingFiles"; when it is`,
-    `above zero the answer may not reflect recent edits, and asking again shortly will`,
-    `give a more complete picture.`,
+    `Embedding happens in the background and is never waited for. An incomplete index is`,
+    `reported as "progress" (files in scope, files embedded, percent complete); until half`,
+    `of a large project is embedded, detect_duplication reports progress instead of`,
+    `findings. Ask again shortly, or follow duplication_status.`,
+    ``,
+    `Scope is yours to set, in ${CONFIG_FILE_NAME} in the project root. Without that file`,
+    `every source file under the root is analysed, which on a first run is usually more`,
+    `than intended. Edit or create it directly — it is plain JSON and edits are picked up`,
+    `before the next question, no restart:`,
+    ``,
+    `  { "include": ["src/**"], "exclude": ["vendor/**", "**/*.generated.*"] }`,
+    ``,
+    `Globs match project-relative paths with forward slashes, and exclude wins over`,
+    `include. Nested repositories — git submodules and vendored clones — are left out by`,
+    `default as other projects' code; "includeNestedRepositories": true brings them in.`,
   ];
 
   if (modelStore.status() !== 'ready') {

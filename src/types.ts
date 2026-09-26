@@ -82,6 +82,41 @@ export interface IndexStatus {
 export type ModelStatus = 'ready' | 'not-installed' | 'incomplete';
 
 /**
+ * How far the index has got, so a caller can tell a complete answer from an
+ * early one and decide whether to ask again.
+ */
+export interface IndexProgress {
+  filesInScope: number;
+  filesEmbedded: number;
+  pendingFiles: number;
+  /** 0 to 100. */
+  percentComplete: number;
+}
+
+/** How many files one folder contributes to the analysis. */
+export interface FolderSize {
+  folder: string;
+  files: number;
+}
+
+/**
+ * What is being analysed, reported when the scope looks wider than the team
+ * probably meant — the first run in a repository, where nothing has been
+ * narrowed yet, is the case this exists for.
+ */
+export interface ScopeSummary {
+  filesInScope: number;
+  /** Where the scope is written down, whether or not the file exists yet. */
+  configFile: string;
+  /** False when there is no config file, so everything under the root is in scope. */
+  configured: boolean;
+  /** The folders contributing the most files, so an unwanted tree is easy to spot. */
+  largestFolders: FolderSize[];
+  /** Repositories of their own, left out of the analysis. */
+  skippedNestedRepositories?: string[];
+}
+
+/**
  * How much to trust a finding.
  *
  * - `certain`   the blocks are the same code once formatting and comments are

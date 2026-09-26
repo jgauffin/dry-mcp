@@ -123,17 +123,40 @@ Embedding a project takes minutes, which nobody will wait for mid-question. So
 changed files are queued and embedded in the background, and questions are
 answered from whatever is ready.
 
-The cost of that choice is that an answer can be out of date, so **every reply
-reports how many files are still queued**:
+The cost of that choice is that an answer can be out of date, so **every
+incomplete reply reports how far the index has got**:
 
 ```yaml
-status:
- pendingFiles: 12
-notice: 12 file(s) are queued for embedding, so recent changes may not be
-  reflected yet. Ask again shortly for a complete picture.
+progress:
+ filesInScope: 3510
+ filesEmbedded: 1204
+ pendingFiles: 2306
+ percentComplete: 34
 ```
 
-When nothing is queued, both fields are absent and the answer is complete.
+When nothing is queued, the block is absent and the answer is complete.
+
+Below half embedded, a project larger than a couple of hundred files gets that
+progress **instead of** findings. A ranking drawn from a third of a codebase is
+not an early version of the real ranking: the worst duplication is most likely in
+the part not yet read, while the reply reads like an answer and invites acting on
+whatever was indexed first. Small projects are always ranked as they stand, since
+they finish before anyone could ask twice.
+
+## Scope
+
+Without a `duplication.config.json` every source file under the root is
+analysed, which on a first run is rarely what was meant. So when the project is
+large and nothing has been narrowed, the reply names the file count and the
+largest folders and says what to write — the calling agent can edit that file
+itself, and the rules are re-read before the next question.
+
+Directories that are repositories of their own — git submodules, vendored clones
+— are left out by default. They are another project's code: duplication inside
+one cannot be fixed from here, and on a first run in a repository with
+submodules it is most of what would be reported. The skipped paths are named in
+the reply rather than dropped quietly, because a team that does own its
+submodules has to be able to see why their code never appears.
 
 Vectors are cached in SQLite keyed by *content*, not location, so moving a block,
 re-indenting it or adding a comment all reuse the stored vector, and identical
@@ -157,11 +180,11 @@ code.
 
 ## Verification
 
-92 unit and end-to-end tests run without the model, using a structure-aware stub
-embedder, so the pipeline is exercised offline. 7 integration tests run against
-the real model and cover what a stub cannot prove — that renames land above the
-threshold, that unrelated code and same-shaped-but-different code land below, and
-that the same logic written in another language is still recognised.
+The unit and end-to-end suites run without the model, using a structure-aware
+stub embedder, so the pipeline is exercised offline. The integration suite runs
+against the real model and covers what a stub cannot prove — that renames land
+above the threshold, that unrelated code and same-shaped-but-different code land
+below, and that the same logic written in another language is still recognised.
 
 Beyond the suites, the detector has been run over a real 7,400-line codebase.
 That is what surfaced the size-scaling problem, the window-overlap double
