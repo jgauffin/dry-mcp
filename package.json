@@ -1,0 +1,51 @@
+{
+  "name": "duplication-mcp",
+  "version": "0.1.0",
+  "description": "Ranks code duplication by size and frequency, using code embeddings to find near-misses",
+  "author": "jgauffin",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "duplication-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "duplication",
+    "clone-detection",
+    "embeddings",
+    "code-quality"
+  ],
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "minimatch": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^4.0.18"
+  },
+  "comments": {
+    "overrides": "sharp only serves image inputs, which this server never uses; the pinned version is the one the internal registry accepts."
+  },
+  "overrides": {
+    "sharp": "^0.35.4"
+  },
+  "files": [
+    "dist",
+    "ReadMe.md"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
