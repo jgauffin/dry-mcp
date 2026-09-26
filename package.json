@@ -36,7 +36,7 @@
     "vitest": "^4.0.18"
   },
   "comments": {
-    "overrides": "sharp only serves image inputs, which this server never uses; the pinned version is the one the internal registry accepts."
+    "overrides": "sharp only serves image inputs, which this server never uses. Pinned to 0.35.x because it installs from prebuilt @img/sharp-* binaries; 0.34.x runs an install script, which fails wherever npm install scripts are not allowlisted."
   },
   "overrides": {
     "sharp": "^0.35.4"

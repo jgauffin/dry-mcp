@@ -57,6 +57,35 @@ function vocabularyVector(text: string): Embedding {
   return vector;
 }
 
+/**
+ * Places each block at a chosen angle, so the similarity between any two of them
+ * is exact and a threshold can be aimed deliberately between them.
+ */
+class FixedAngleEmbedder implements Embedder {
+  async embed(texts: string[]): Promise<Embedding[]> {
+    const vectors: Embedding[] = [];
+    for (const text of texts) {
+      const radians = (degreesFor(text) * Math.PI) / 180;
+      vectors.push(new Float32Array([Math.cos(radians), Math.sin(radians)]));
+    }
+    return vectors;
+  }
+}
+
+/**
+ * Where each marked block sits. Alpha and beta are 20 degrees apart (0.94) while
+ * gamma is 60 from alpha (0.5), so a threshold of 0.8 groups the pair and the
+ * default 0.45 takes in all three.
+ */
+const BLOCK_ANGLES: Record<string, number> = { alpha: 0, beta: 20, gamma: 60 };
+
+function degreesFor(text: string): number {
+  for (const [marker, degrees] of Object.entries(BLOCK_ANGLES)) {
+    if (text.includes(marker)) return degrees;
+  }
+  return 90;
+}
+
 /** A model store that claims readiness, for tests that never load the model. */
 function readyModelStore(): ModelStore {
   const store = new ModelStore(DEFAULT_CONFIG.model);
@@ -79,9 +108,12 @@ describe('Duplication analysis', () => {
   let cacheDirectory: string;
   let service: DuplicationService;
 
-  function buildService(store: ModelStore = readyModelStore()): DuplicationService {
+  function buildService(
+    store: ModelStore = readyModelStore(),
+    embedder: Embedder = new StubEmbedder()
+  ): DuplicationService {
     const cache = new EmbeddingCache(path.join(cacheDirectory, 'test.db'), 'test-model');
-    return new DuplicationService(projectRoot, DEFAULT_CONFIG, cache, store, new StubEmbedder());
+    return new DuplicationService(projectRoot, DEFAULT_CONFIG, cache, store, embedder);
   }
 
   beforeEach(() => {
@@ -263,6 +295,38 @@ describe('Duplication analysis', () => {
     expect(explained).not.toBeNull();
     expect(explained!.sources.length).toBe(found.occurrences.length);
     expect(explained!.sources[0].text).toContain('fetchable');
+  });
+
+  it('A_finding_reported_under_a_stricter_threshold_can_still_be_explained', async () => {
+    fs.writeFileSync(path.join(projectRoot, 'a.ts'), duplicatedFunction('alpha', 8));
+    fs.writeFileSync(path.join(projectRoot, 'b.ts'), duplicatedFunction('beta', 8));
+    fs.writeFileSync(path.join(projectRoot, 'c.ts'), duplicatedFunction('gamma', 8));
+
+    service = buildService(readyModelStore(), new FixedAngleEmbedder());
+    service.refresh();
+    await service.waitForEmbedding();
+
+    const strict = service.analyze({ similarityThreshold: 0.8 });
+
+    expect(strict.duplications.length).toBeGreaterThan(0);
+    for (const finding of strict.duplications) {
+      expect(service.explain(finding.id), `finding ${finding.id}`).not.toBeNull();
+    }
+  });
+
+  it('A_finding_whose_copies_are_gone_is_reported_as_gone_rather_than_from_memory', async () => {
+    const body = duplicatedFunction('removed', 8);
+    fs.writeFileSync(path.join(projectRoot, 'a.ts'), body);
+    fs.writeFileSync(path.join(projectRoot, 'b.ts'), body);
+
+    service = buildService();
+    service.refresh();
+    await service.waitForEmbedding();
+    const found = service.analyze().duplications[0];
+
+    fs.rmSync(path.join(projectRoot, 'b.ts'));
+
+    expect(service.explain(found.id)).toBeNull();
   });
 
   it('Asking_about_a_finding_that_no_longer_exists_explains_itself', () => {

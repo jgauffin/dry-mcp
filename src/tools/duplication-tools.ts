@@ -103,8 +103,9 @@ export const duplicationTools: ToolModule = {
       if (!explanation) {
         return {
           notice:
-            `No duplication with id "${clusterId}" was found. Ids change when the code ` +
-            `changes, so run detect_duplication again for a current one.`,
+            `No duplication with id "${clusterId}" was found. An id stops resolving once ` +
+            `the code it points at has been edited, so run detect_duplication again for a ` +
+            `current one.`,
         };
       }
 

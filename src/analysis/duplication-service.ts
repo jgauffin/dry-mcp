@@ -17,7 +17,13 @@ import { rankBySeverity, rankByFrequency } from './ranker.js';
 import { EmbeddingCache } from '../cache/embedding-cache.js';
 import { ModelStore } from '../embedding/model-store.js';
 import { LocalEmbedder, type Embedder } from '../embedding/embedder.js';
-import { GenerationQueue, type FileScan, type SourceFile } from '../embedding/queue.js';
+import {
+  GenerationQueue,
+  hashContent,
+  type FileScan,
+  type SourceFile,
+} from '../embedding/queue.js';
+import { ReportedFindings, type RememberedFinding } from './reported-findings.js';
 import { normalizePath } from '../paths.js';
 
 /** The longest block compared as a single unit, before windowing takes over. */
@@ -49,6 +55,20 @@ export interface DuplicationQuery {
    * project setting for this question only.
    */
   similarityThreshold?: number;
+}
+
+/** Every block worth comparing, and the state of the files they came from. */
+interface ProjectBlocks {
+  chunks: Chunk[];
+  /** Content hash per file, so a finding can later be told apart from an edited file. */
+  contentHashes: Map<string, string>;
+}
+
+/** One copy's source, as returned when a finding is explained. */
+interface OccurrenceSource {
+  file: string;
+  startLine: number;
+  text: string;
 }
 
 export interface DuplicationReport {
@@ -90,6 +110,8 @@ export class DuplicationService {
   private modelStore: ModelStore;
   private queue: GenerationQueue;
   private draining: Promise<void> | null = null;
+  /** What has already been reported, so a finding can be looked up by its id. */
+  private reported = new ReportedFindings();
   /** What the config file said last time it was read, to notice a rewrite. */
   private configFingerprint: string;
 
@@ -231,10 +253,10 @@ export class DuplicationService {
       };
     }
 
-    const chunks = this.collectChunks(query.minLines);
-    const vectors = this.vectorsFor(chunks);
+    const blocks = this.readProject(query.minLines);
+    const vectors = this.vectorsFor(blocks.chunks);
     const judged = this.idiomFilter.apply(
-      this.clustererFor(query.similarityThreshold).cluster(chunks, vectors)
+      this.clustererFor(query.similarityThreshold).cluster(blocks.chunks, vectors)
     );
 
     const reportable: DuplicationCluster[] = [];
@@ -269,22 +291,73 @@ export class DuplicationService {
     if (notice) report.notice = notice;
     if (query.includeSuppressed) report.suppressedIdioms = rankBySeverity(suppressed);
 
+    // Only what this answer hands out: an id a caller never saw is not one they
+    // can come back and ask about.
+    this.reported.remember(report.duplications, blocks.contentHashes);
+    if (report.suppressedIdioms) {
+      this.reported.remember(report.suppressedIdioms, blocks.contentHashes);
+    }
+
     return report;
   }
 
-  /** The full source of one finding, for acting on it. */
-  explain(clusterId: string): { cluster: DuplicationCluster; sources: { file: string; startLine: number; text: string }[] } | null {
-    const chunks = this.collectChunks();
-    const vectors = this.vectorsFor(chunks);
-    const clusters = this.idiomFilter.apply(this.clusterer.cluster(chunks, vectors));
+  /**
+   * The full source of one finding, for acting on it.
+   *
+   * Answered from what was reported, because that is the only grouping the id
+   * belongs to: the same project regrouped under a different threshold, a
+   * different minimum block length, or simply with more of it embedded, puts the
+   * code in different groups and so gives it different ids.
+   */
+  explain(
+    clusterId: string
+  ): { cluster: DuplicationCluster; sources: OccurrenceSource[] } | null {
+    const remembered = this.reported.find(clusterId);
+    if (remembered) {
+      const sources = this.sourcesAsReported(remembered);
+      if (sources) return { cluster: remembered.cluster, sources };
+    }
+
+    // Either nothing remembers this id — the server has restarted, or the answer
+    // that carried it is long past — or the code has moved since, which makes the
+    // remembered line ranges describe the wrong place. Group the project as it is
+    // now and see whether the finding is still there.
+    const blocks = this.readProject();
+    const vectors = this.vectorsFor(blocks.chunks);
+    const clusters = this.idiomFilter.apply(this.clusterer.cluster(blocks.chunks, vectors));
 
     const match = clusters.find((cluster) => cluster.id === clusterId);
     if (!match) return null;
 
-    const sources: { file: string; startLine: number; text: string }[] = [];
-    for (const occurrence of match.occurrences) {
-      const content = this.readFile(occurrence.file);
-      if (!content) continue;
+    return { cluster: match, sources: this.sourcesOf(match, (file) => this.readFile(file)) };
+  }
+
+  /**
+   * The source of a remembered finding, or nothing if any file behind it has
+   * changed since — the line ranges then point somewhere else, and reporting
+   * that as the duplicated code would be worse than not answering.
+   */
+  private sourcesAsReported(remembered: RememberedFinding): OccurrenceSource[] | null {
+    const texts = new Map<string, string>();
+
+    for (const [file, contentHash] of remembered.contentHashes) {
+      const content = this.readFile(file);
+      if (content === null || hashContent(content) !== contentHash) return null;
+      texts.set(file, content);
+    }
+
+    return this.sourcesOf(remembered.cluster, (file) => texts.get(file) ?? null);
+  }
+
+  private sourcesOf(
+    cluster: DuplicationCluster,
+    textOf: (file: string) => string | null
+  ): OccurrenceSource[] {
+    const sources: OccurrenceSource[] = [];
+
+    for (const occurrence of cluster.occurrences) {
+      const content = textOf(occurrence.file);
+      if (content === null) continue;
       const lines = content.split('\n');
       sources.push({
         file: occurrence.file,
@@ -293,7 +366,7 @@ export class DuplicationService {
       });
     }
 
-    return { cluster: match, sources };
+    return sources;
   }
 
   /** Queues everything again, for when the caller wants a clean rebuild. */
@@ -379,15 +452,17 @@ export class DuplicationService {
   }
 
   /**
-   * Every block in the project worth comparing.
+   * Every block in the project worth comparing, with a hash of each file it came
+   * from.
    *
    * Files are read one at a time and their text dropped once chunked, so what
    * survives the walk is the blocks themselves rather than a copy of the whole
    * codebase alongside them.
    */
-  private collectChunks(minLines?: number): Chunk[] {
+  private readProject(minLines?: number): ProjectBlocks {
     const threshold = minLines ?? this.config.minLines;
     const chunks: Chunk[] = [];
+    const contentHashes = new Map<string, string>();
 
     for (const scan of this.listProject()) {
       if (scan.size > MAX_FILE_BYTES) continue;
@@ -395,12 +470,14 @@ export class DuplicationService {
       const file = this.readSource(scan.file);
       if (!file) continue;
 
+      contentHashes.set(file.file, hashContent(file.content));
+
       for (const chunk of this.chunker.chunk(file.file, file.content)) {
         if (chunk.significantLines >= threshold) chunks.push(chunk);
       }
     }
 
-    return chunks;
+    return { chunks, contentHashes };
   }
 
   /** The vectors already computed for these blocks; misses are simply absent. */

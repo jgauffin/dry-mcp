@@ -1,0 +1,8 @@
+{
+    "kiwiAgent.permissions.allow": [
+        "Bash(npm run:*)",
+        "Bash(node:*)",
+        "Bash(npm test:*)",
+        "Bash(timeout:*)"
+    ]
+}
