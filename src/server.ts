@@ -94,6 +94,23 @@ export function createServer(projectRoot?: string, options?: ServerOptions): Mcp
   return mcpServer;
 }
 
+/**
+ * Asks the operating system to schedule this server behind whatever the
+ * developer is doing.
+ *
+ * Nothing here is ever urgent: the work is triggered by code changing, not by
+ * anyone asking, so a compile or an editor should always win the core. This only
+ * decides who waits when the machine is full, so it costs nothing when it is not.
+ */
+function yieldToTheDeveloper(): void {
+  try {
+    os.setPriority(os.constants.priority.PRIORITY_BELOW_NORMAL);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`Could not lower process priority, continuing at normal: ${detail}`);
+  }
+}
+
 /** What the calling agent needs to know before using these tools. */
 function instructionsFor(root: string, modelStore: ModelStore): string {
   const lines = [
@@ -151,6 +168,7 @@ export async function startServer(projectRoot?: string, options?: ServerOptions)
   // would otherwise share one index — and makes the startup line say where the
   // server is actually looking.
   const resolvedRoot = path.resolve(projectRoot ?? process.cwd());
+  yieldToTheDeveloper();
   const mcpServer = createServer(resolvedRoot, options);
 
   await mcpServer.connect(new StdioServerTransport());

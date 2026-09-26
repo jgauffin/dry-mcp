@@ -3,6 +3,7 @@ import type { Chunk, Embedding } from '../types.js';
 import type { EmbeddingCache } from '../cache/embedding-cache.js';
 import type { Chunker } from '../chunking/chunker.js';
 import type { Embedder } from './embedder.js';
+import { IndexingPace } from './pacer.js';
 
 /** What the index needs to know about a file to decide whether it has changed. */
 export interface SourceFile {
@@ -57,6 +58,7 @@ export class GenerationQueue {
   private chunkerFor: () => Chunker;
   private embedder: Embedder;
   private source: SourceProvider;
+  private pace: IndexingPace;
   private running: Promise<void> | null = null;
   private stopRequested = false;
   /** Files the scan has already read, waiting to be embedded without a second read. */
@@ -71,12 +73,14 @@ export class GenerationQueue {
     cache: EmbeddingCache,
     chunker: Chunker | (() => Chunker),
     embedder: Embedder,
-    source: SourceProvider
+    source: SourceProvider,
+    pace: IndexingPace = new IndexingPace()
   ) {
     this.cache = cache;
     this.chunkerFor = typeof chunker === 'function' ? chunker : () => chunker;
     this.embedder = embedder;
     this.source = source;
+    this.pace = pace;
   }
 
   /**
@@ -229,6 +233,10 @@ export class GenerationQueue {
    * same content hash.
    */
   private async embedFile(file: SourceFile): Promise<void> {
+    // Cutting a file into blocks and hashing them is CPU of its own, not just a
+    // preamble to the model: on a project of mostly unchanged code it is all the
+    // work there is, so it is paced like the rest.
+    const startedReading = Date.now();
     const chunks = this.chunkerFor().chunk(file.file, file.content);
     const contentHash = hashContent(file.content);
 
@@ -247,6 +255,8 @@ export class GenerationQueue {
       if (!known.has(chunk.normalizedHash)) missing.push(chunk);
     }
 
+    await this.pace.afterWorking(Date.now() - startedReading);
+
     for (let start = 0; start < missing.length; start += EMBED_BATCH_SIZE) {
       if (this.stopRequested) return;
 
@@ -256,6 +266,7 @@ export class GenerationQueue {
         texts.push(missing[i].text);
       }
 
+      const startedEmbedding = Date.now();
       const vectors = await this.embedder.embed(texts);
       const entries: { chunkHash: string; vector: Embedding }[] = [];
       for (let i = start; i < end; i++) {
@@ -266,6 +277,11 @@ export class GenerationQueue {
         missing[i].text = '';
       }
       this.cache.putVectors(entries);
+
+      // Rested between batches rather than between files: one large file can be
+      // hundreds of blocks, and holding the machine for all of them is exactly
+      // what the pace exists to prevent.
+      await this.pace.afterWorking(Date.now() - startedEmbedding);
     }
 
     this.cache.markClean(file.file, file.mtime, byteLengthOf(file.content), contentHash, Array.from(wanted));

@@ -52,7 +52,9 @@ export class ToolHandler {
         this.service.refresh();
       }
 
-      const result = await handler(args, this.service);
+      // Answering is the only time somebody is waiting, so it is the only time
+      // the server is allowed to use the machine freely.
+      const result = await this.service.whileAnswering(async () => handler(args, this.service));
       return { content: [{ type: 'text', text: toYaml(result) }] };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

@@ -60,6 +60,16 @@ export const MAX_TOKENS_PER_BLOCK = 1024;
 export const ATTENTION_BUDGET = 8 * 512 * 512;
 
 /**
+ * How many threads the model may use.
+ *
+ * Two, because a developer runs one of these servers per open project and is
+ * building and editing on the same machine. More threads shorten a first index
+ * but every one of them is taken from the work the developer is waiting on, and
+ * the pace between batches is what decides the cost anyway.
+ */
+const BACKGROUND_THREADS = 2;
+
+/**
  * The real embedder, running the model locally through ONNX.
  *
  * Nothing is fetched from the network: the model is downloaded deliberately by
@@ -136,6 +146,15 @@ export class LocalEmbedder implements Embedder {
 
     const loaded = await pipeline('feature-extraction', modelRepositoryOf(this.store), {
       dtype: this.store.precision === 'int8' ? 'q8' : 'fp32',
+      session_options: {
+        // Left alone, the runtime takes a thread per core and keeps them
+        // spinning between batches, so one server idles at the cost of a busy
+        // machine and several make it unusable. Indexing is background work: it
+        // gets a couple of threads and gives the rest back.
+        intraOpNumThreads: BACKGROUND_THREADS,
+        interOpNumThreads: 1,
+        executionMode: 'sequential',
+      },
     });
 
     return loaded as unknown as Extractor;

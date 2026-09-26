@@ -10,6 +10,7 @@ import {
 } from '../src/embedding/queue.js';
 import { EmbeddingCache } from '../src/cache/embedding-cache.js';
 import { Chunker } from '../src/chunking/chunker.js';
+import { IndexingPace } from '../src/embedding/pacer.js';
 import type { Embedder } from '../src/embedding/embedder.js';
 import type { Embedding } from '../src/types.js';
 
@@ -161,6 +162,48 @@ describe('Embedding generation queue', () => {
     const unique = new Set(embedder.embedded);
     expect(embedder.embedded.length).toBe(unique.size);
   });
+
+  it('Indexing_in_the_background_rests_so_it_does_not_take_the_whole_machine', async () => {
+    const { paced, rests } = pacedQueue();
+
+    paced.scanForChanges();
+    await paced.drain();
+
+    expect(rests.length).toBeGreaterThan(0);
+  });
+
+  it('Indexing_runs_without_resting_while_a_question_is_being_answered', async () => {
+    const { paced, pace, rests } = pacedQueue();
+
+    paced.scanForChanges();
+    await pace.whileAnswering(() => paced.drain());
+
+    expect(rests).toEqual([]);
+  });
+
+  /**
+   * A queue that must rest after any work at all, since the fake embedder
+   * returns too fast to fill a real slice.
+   */
+  function pacedQueue() {
+    const rests: number[] = [];
+    const pace = new IndexingPace({
+      workSliceMs: 0,
+      sleep: async (ms) => {
+        rests.push(ms);
+      },
+    });
+
+    const paced = new GenerationQueue(
+      cache,
+      new Chunker({ minLines: 3, maxLines: 100 }),
+      embedder,
+      providerOver(() => files),
+      pace
+    );
+
+    return { paced, pace, rests };
+  }
 });
 
 function countDuplicates(values: string[]): number {

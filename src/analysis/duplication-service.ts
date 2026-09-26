@@ -26,6 +26,7 @@ import {
   type FileScan,
   type SourceFile,
 } from '../embedding/queue.js';
+import { IndexingPace } from '../embedding/pacer.js';
 import { ReportedFindings, type RememberedFinding } from './reported-findings.js';
 import { normalizePath } from '../paths.js';
 
@@ -147,6 +148,8 @@ export class DuplicationService {
   private cache: EmbeddingCache;
   private modelStore: ModelStore;
   private queue: GenerationQueue;
+  /** Keeps background indexing from taking the machine the developer is working on. */
+  private pace = new IndexingPace();
   private draining: Promise<void> | null = null;
   /** What has already been reported, so a finding can be looked up by its id. */
   private reported = new ReportedFindings();
@@ -177,8 +180,20 @@ export class DuplicationService {
       {
         list: () => this.listProject(),
         read: (file) => this.readSource(file),
-      }
+      },
+      this.pace
     );
+  }
+
+  /**
+   * Runs a request at full speed, and lets background indexing run at full speed
+   * for as long as it lasts.
+   *
+   * Someone is waiting for a request, so pacing it would only make them wait
+   * longer; between requests nobody is, which is when the pace applies.
+   */
+  whileAnswering<T>(work: () => Promise<T>): Promise<T> {
+    return this.pace.whileAnswering(work);
   }
 
   /**
