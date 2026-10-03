@@ -134,6 +134,31 @@ describe('Chunker', () => {
       expect(chunk.significantLines).toBeLessThanOrEqual(50);
     }
   });
+
+  it('Each_window_remembers_the_block_it_was_cut_from', () => {
+    const body: string[] = ['function huge() {'];
+    for (let i = 0; i < 300; i++) {
+      body.push(`  step${i}();`);
+    }
+    body.push('}');
+
+    const windowing = new Chunker({ minLines: 3, maxLines: 50 });
+    const chunks = windowing.chunk('src/huge.js', body.join('\n'));
+
+    for (const chunk of chunks) {
+      expect(chunk.blockStartLine).toBe(1);
+      expect(chunk.blockEndLine).toBe(302);
+    }
+  });
+
+  it('A_block_short_enough_to_compare_whole_is_its_own_block', () => {
+    const source = ['function f() {', '  a();', '  b();', '  c();', '}'].join('\n');
+
+    const [chunk] = chunker.chunk('src/f.js', source);
+
+    expect(chunk.blockStartLine).toBeUndefined();
+    expect(chunk.blockEndLine).toBeUndefined();
+  });
 });
 
 describe('Comment stripping', () => {

@@ -8,6 +8,7 @@ import type {
 } from '../types.js';
 import { cosineSimilarity } from '../embedding/embedder.js';
 import { medianLinesOf, removableLines, severityOf } from './ranker.js';
+import { alignment, contentLines, type LineTokens } from './line-alignment.js';
 
 export interface ClusteringOptions {
   /** How alike two blocks must be to be called the same code. */
@@ -45,6 +46,30 @@ const SIZE_SCALING_ENDS_AT = 100;
  * them.
  */
 const LARGEST_BLOCK_PENALTY = 0.35;
+
+/**
+ * The least share of lines two blocks must have in common, in order, to be
+ * called the same code once their embeddings agree.
+ *
+ * Embeddings alone group code that only has the same shape: on a real project
+ * three unrelated test suites and sixteen unrelated tool classes each formed a
+ * "duplication", all rated high. A copy keeps its lines; shape-alike code does
+ * not. Measured on that project, those pairs aligned at 0.21 at most and test
+ * cases sharing only a fixture's vocabulary at 0.5 to 0.61, while real copies
+ * aligned from 0.67 up — a function renamed throughout, and the same logic
+ * rewritten in C#, both reach 0.8.
+ */
+export const MIN_ALIGNMENT = 0.65;
+
+/** Line alignment at and above which a near-miss may be trusted moderately, and highly. */
+const MODERATE_ALIGNMENT = 0.7;
+const HIGH_ALIGNMENT = 0.75;
+
+/**
+ * How much of an occurrence a larger finding must cover for the occurrence to
+ * count as already reported.
+ */
+const REDUNDANT_COVERAGE = 0.8;
 
 /**
  * Groups the code blocks that say the same thing.
@@ -98,22 +123,28 @@ export class Clusterer {
         const expanded = membersOf.get(representative.normalizedHash) ?? [representative];
         members.push(...expanded);
       }
-      clusters.push(this.buildCluster(members, group.similarity, 'near-identical'));
+      clusters.push(
+        this.buildCluster(members, group.similarity, 'near-identical', group.alignment)
+      );
     }
 
-    return this.withoutContainedClusters(clusters);
+    return this.withoutRedundantClusters(clusters);
   }
 
   /**
-   * Drops findings that live entirely inside a larger finding.
+   * Drops findings that live inside, or almost entirely over, a larger finding.
    *
    * Copying a function also copies the loop inside it, so both are genuinely
    * repeated. Reporting them separately would have a developer fix the
    * function and find the inner finding already gone — the same work counted
    * twice. The largest containing block is the actionable one, so only that is
    * kept.
+   *
+   * Almost is enough: two nested blocks that start a line apart are windowed a
+   * line apart, and each set of windows matches the same copy elsewhere. That
+   * is one duplication, not one per set of windows.
    */
-  private withoutContainedClusters(clusters: DuplicationCluster[]): DuplicationCluster[] {
+  private withoutRedundantClusters(clusters: DuplicationCluster[]): DuplicationCluster[] {
     const bySize = [...clusters];
     bySize.sort((a, b) => b.medianLines - a.medianLines);
 
@@ -134,20 +165,16 @@ export class Clusterer {
   }
 
   /**
-   * Whether every occurrence of one finding sits inside an occurrence of
-   * another. Requiring all of them matters: a block repeated both inside a
-   * duplicated function and somewhere else entirely is still worth its own
-   * finding.
+   * Whether every occurrence of one finding sits inside, or almost entirely
+   * over, an occurrence of another. Requiring all of them matters: a block
+   * repeated both inside a duplicated function and somewhere else entirely is
+   * still worth its own finding.
    */
   private isContainedIn(inner: DuplicationCluster, outer: DuplicationCluster): boolean {
     for (const occurrence of inner.occurrences) {
       let covered = false;
       for (const candidate of outer.occurrences) {
-        if (
-          candidate.file === occurrence.file &&
-          occurrence.startLine >= candidate.startLine &&
-          occurrence.endLine <= candidate.endLine
-        ) {
+        if (coverageOf(occurrence, candidate) >= REDUNDANT_COVERAGE) {
           covered = true;
           break;
         }
@@ -214,7 +241,7 @@ export class Clusterer {
   private groupSimilar(
     chunks: Chunk[],
     vectors: Map<string, Embedding>
-  ): { chunks: Chunk[]; similarity: number }[] {
+  ): { chunks: Chunk[]; similarity: number; alignment: number }[] {
     const comparable: Chunk[] = [];
     for (const chunk of chunks) {
       if (vectors.has(chunk.normalizedHash)) comparable.push(chunk);
@@ -225,7 +252,18 @@ export class Clusterer {
     comparable.sort((a, b) => b.significantLines - a.significantLines);
 
     const assigned = new Set<string>();
-    const groups: { chunks: Chunk[]; similarity: number }[] = [];
+    const groups: { chunks: Chunk[]; similarity: number; alignment: number }[] = [];
+    // Each block's lines are worked out once, however many seeds it is held
+    // up against.
+    const linesOf = new Map<string, LineTokens[]>();
+    const lines = (chunk: Chunk): LineTokens[] => {
+      let known = linesOf.get(chunk.normalizedHash);
+      if (!known) {
+        known = contentLines(chunk.text);
+        linesOf.set(chunk.normalizedHash, known);
+      }
+      return known;
+    };
 
     for (let i = 0; i < comparable.length; i++) {
       const seed = comparable[i];
@@ -233,6 +271,7 @@ export class Clusterer {
 
       const members: Chunk[] = [seed];
       let lowest = 1;
+      let lowestAlignment = 1;
 
       for (let j = i + 1; j < comparable.length; j++) {
         const candidate = comparable[j];
@@ -248,16 +287,26 @@ export class Clusterer {
           vectors.get(candidate.normalizedHash)!
         );
 
-        if (similarity >= this.thresholdFor(seed, candidate)) {
-          members.push(candidate);
-          assigned.add(candidate.normalizedHash);
-          if (similarity < lowest) lowest = similarity;
-        }
+        if (similarity < this.thresholdFor(seed, candidate)) continue;
+
+        // Checked only once the embeddings agree, which keeps it to the few
+        // pairs worth the cost.
+        const aligned = alignment(lines(seed), lines(candidate));
+        if (aligned < MIN_ALIGNMENT) continue;
+
+        members.push(candidate);
+        assigned.add(candidate.normalizedHash);
+        if (similarity < lowest) lowest = similarity;
+        if (aligned < lowestAlignment) lowestAlignment = aligned;
       }
 
       if (members.length > 1) {
         assigned.add(seed.normalizedHash);
-        groups.push({ chunks: members, similarity: round(lowest) });
+        groups.push({
+          chunks: members,
+          similarity: round(lowest),
+          alignment: round(lowestAlignment),
+        });
       }
     }
 
@@ -293,10 +342,21 @@ export class Clusterer {
     return smaller / larger >= 1 - SIZE_TOLERANCE;
   }
 
-  /** Whether two blocks cover any of the same lines of the same file. */
+  /**
+   * Whether two blocks cover any of the same lines of the same file.
+   *
+   * Windows are judged by the whole block they were cut from. Two windows of
+   * one long block can be many lines apart and still be the same code — written
+   * by the same hand in the same style, they score as alike as a real copy —
+   * and the same goes for windows of two blocks nested one inside the other.
+   */
   private overlaps(first: Chunk, second: Chunk): boolean {
     if (first.file !== second.file) return false;
-    return first.startLine <= second.endLine && second.startLine <= first.endLine;
+    const firstStart = first.blockStartLine ?? first.startLine;
+    const firstEnd = first.blockEndLine ?? first.endLine;
+    const secondStart = second.blockStartLine ?? second.startLine;
+    const secondEnd = second.blockEndLine ?? second.endLine;
+    return firstStart <= secondEnd && secondStart <= firstEnd;
   }
 
   /** Whether a block shares lines with any block already in the group. */
@@ -310,7 +370,8 @@ export class Clusterer {
   private buildCluster(
     chunks: Chunk[],
     similarity: number,
-    matchType: 'identical' | 'near-identical'
+    matchType: 'identical' | 'near-identical',
+    aligned?: number
   ): DuplicationCluster {
     const occurrences: Occurrence[] = [];
     for (const chunk of chunks) {
@@ -327,7 +388,7 @@ export class Clusterer {
     const frequency = occurrences.length;
     const medianLines = medianLinesOf(occurrences);
 
-    return {
+    const cluster: DuplicationCluster = {
       id: identityOf(occurrences),
       occurrences,
       frequency,
@@ -336,9 +397,11 @@ export class Clusterer {
       severity: severityOf(medianLines, frequency),
       similarity,
       matchType,
-      confidence: confidenceOf(similarity, medianLines, matchType),
+      confidence: confidenceOf(similarity, medianLines, matchType, aligned),
       preview: previewOf(chunks[0]),
     };
+    if (aligned !== undefined) cluster.alignment = aligned;
+    return cluster;
   }
 }
 
@@ -353,7 +416,8 @@ export class Clusterer {
 function confidenceOf(
   similarity: number,
   medianLines: number,
-  matchType: 'identical' | 'near-identical'
+  matchType: 'identical' | 'near-identical',
+  aligned = 1
 ): Confidence {
   if (matchType === 'identical') return 'certain';
 
@@ -371,7 +435,26 @@ function confidenceOf(
   // one step less whatever it scored.
   if (medianLines <= 8 && level > 0) level--;
 
-  return levels[level];
+  // However alike the embeddings say the code reads, a finding is only as
+  // trustworthy as the lines it actually shares: embeddings score shape, this
+  // scores copying.
+  const byLines = aligned >= HIGH_ALIGNMENT ? 2 : aligned >= MODERATE_ALIGNMENT ? 1 : 0;
+
+  return levels[Math.min(level, byLines)];
+}
+
+/**
+ * How much of one occurrence another occurrence covers, from 0 to 1. Different
+ * files never cover each other.
+ */
+function coverageOf(occurrence: Occurrence, by: Occurrence): number {
+  if (occurrence.file !== by.file) return 0;
+
+  const start = Math.max(occurrence.startLine, by.startLine);
+  const end = Math.min(occurrence.endLine, by.endLine);
+  if (end < start) return 0;
+
+  return (end - start + 1) / (occurrence.endLine - occurrence.startLine + 1);
 }
 
 /**

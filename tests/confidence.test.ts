@@ -4,10 +4,14 @@ import { hashNormalized } from '../src/chunking/normalizer.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
 import type { Chunk, Embedding } from '../src/types.js';
 
+/**
+ * A block whose body lines are shared with every other block of the same size,
+ * so the copies line up and the embedding score alone decides the verdict.
+ */
 function chunkOf(file: string, startLine: number, lineCount: number, marker: string): Chunk {
   const body: string[] = [`function ${marker}() {`];
   for (let i = 0; i < lineCount - 2; i++) {
-    body.push(`  ${marker}Step${i}();`);
+    body.push(`  step${i}();`);
   }
   body.push('}');
   const text = body.join('\n');
@@ -104,6 +108,27 @@ describe('Confidence reported with each finding', () => {
 
     expect(tiny).toBe('moderate');
     expect(normal).toBe('high');
+  });
+
+  it('A_close_embedding_match_whose_lines_barely_line_up_is_not_trusted', () => {
+    // Most of the body is shared, but a good part is not: the embeddings would
+    // call this high on their own, the lines say it is only loosely a copy.
+    const first = chunkOf('a.ts', 1, 20, 'alpha');
+    const lines = first.text.split('\n');
+    for (let i = 13; i < 19; i++) lines[i] = `  somethingElse${i}(withOther, args);`;
+    const text = lines.join('\n');
+    const second: Chunk = { ...first, file: 'b.ts', text, normalizedHash: hashNormalized(text) };
+
+    const [one, two] = pairSeparatedBy(0.95);
+    const vectors = new Map<string, Embedding>([
+      [first.normalizedHash, one],
+      [second.normalizedHash, two],
+    ]);
+
+    const [cluster] = new Clusterer({ similarityThreshold: 0.2 }).cluster([first, second], vectors);
+
+    expect(cluster.alignment).toBeLessThan(0.7);
+    expect(cluster.confidence).toBe('low');
   });
 });
 

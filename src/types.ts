@@ -20,6 +20,14 @@ export interface Chunk {
   normalizedHash: string;
   /** Lines remaining after comments and blank lines are discarded. */
   significantLines: number;
+  /**
+   * The block this chunk was cut from, when it is one window of a block too
+   * long to compare whole. Absent means the chunk is the whole block. Two
+   * windows of one block are pieces of the same code, never copies of each
+   * other, however alike they look.
+   */
+  blockStartLine?: number;
+  blockEndLine?: number;
 }
 
 /** One occurrence of a repeated block. */
@@ -55,6 +63,12 @@ export interface DuplicationCluster {
   severity: number;
   /** 1.0 for identical copies; below that for near-misses found by embedding. */
   similarity: number;
+  /**
+   * For near-misses, the share of lines that line up between the copies, in
+   * order, with most of their words in common. Embeddings also score code that
+   * merely has the same shape; a real copy keeps its lines as well.
+   */
+  alignment?: number;
   /** How the copies differ from each other, when they are not identical. */
   matchType: 'identical' | 'near-identical';
   /**

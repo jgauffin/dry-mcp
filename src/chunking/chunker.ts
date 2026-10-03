@@ -154,7 +154,13 @@ export class Chunker {
     for (const window of this.windows(startLine, endLine)) {
       const windowText = lines.slice(window.start - 1, window.end).join('\n');
       if (countSignificantLines(windowText) < this.options.minLines) continue;
-      chunks.push(this.build(file, lines, window.start, window.end));
+      // Each window remembers the block it was cut from, so two windows of one
+      // block are never mistaken for copies of each other.
+      chunks.push({
+        ...this.build(file, lines, window.start, window.end),
+        blockStartLine: startLine,
+        blockEndLine: endLine,
+      });
     }
   }
 

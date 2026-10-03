@@ -40,7 +40,13 @@ ranked:
   chosen to accept.
 - **Contained in a larger finding** — copying a function also copies the loop
   inside it. Only the outermost actionable block is reported, so the same work
-  is not counted twice.
+  is not counted twice. A finding that lies almost entirely over a larger one
+  (80% of every occurrence) counts as contained too, since two nested blocks a
+  line apart otherwise report the same copy twice.
+- **Pieces of one block** — a block too long to compare whole is cut into
+  overlapping windows, and two windows of one block are never copies of each
+  other, however far apart. Written by the same hand in the same style, they
+  otherwise score as alike as a genuine copy.
 
 Nothing is thrown away: `includeSuppressed` returns these with the reason each
 was demoted, so the rules can be checked and tuned.
@@ -51,6 +57,17 @@ Two passes. Blocks that are textually identical once formatting and comments are
 normalised are grouped by hash, which is exact and free. What remains is compared
 by meaning using [`jina-embeddings-v2-base-code`](https://huggingface.co/jinaai/jina-embeddings-v2-base-code)
 embeddings, which is what catches a copy whose variables were renamed.
+
+Embeddings score how alike code *reads*, which on a real project is not the same
+as whether it was copied: three unrelated test suites sharing describe/it/expect
+scaffolding, or a dozen tool classes each with an async `execute`, score as
+highly as a genuine copy. So a near-miss also has to keep its **lines**. Each
+pair the embeddings accept is aligned line by line, in order, and the share of
+the shorter block that lines up is its `alignment`. Two lines are the same line
+when they share most of their words, or when every word on them is used at the
+same distance from its previous use — which is exactly what survives renaming a
+variable throughout, and what code merely shaped alike does not have. Words in
+strings count, so two `it('…')` lines naming different tests do not match.
 
 Block boundaries are inferred without a parser, so every language the team writes
 is covered. That means line ranges are approximate — the reported source is
@@ -90,6 +107,14 @@ blocks therefore groups half the codebase; one set for long blocks misses rename
 functions. So the configured threshold applies to short blocks and rises with
 length, reaching 0.8 at a hundred lines. Confidence is judged the same way —
 against what a match of *that size* is worth, not against a fixed number.
+
+### Confidence is capped by alignment
+
+Clearing the size-scaled threshold already puts a block a margin above the
+unrelated-code baseline, so judged by embeddings alone nearly every near-miss
+came out `high` — on one project all 274 of them, including pairs at 0.53. A
+near-miss is therefore rated no higher than its alignment allows: below 0.65 it
+is not reported, from 0.7 it can be `moderate`, from 0.75 `high`.
 
 ## Why int8, and why the model is not bundled
 
@@ -177,6 +202,17 @@ functions and large real blocks separately, which is how the size effect came to
 light. `tests/integration/real-model.test.ts` locks the conclusions in: it fails
 if a model change ever collapses the gap between genuine copies and unrelated
 code.
+
+The alignment floor was measured on a 393-file TypeScript project whose fully
+indexed report had been read by hand. The pairs that were wrongly grouped
+aligned at 0.21 at most, and test cases sharing only a fixture's vocabulary at
+0.5 to 0.61. Real copies aligned from 0.67 up: repeated test setup at 0.67, a
+fixture builder copied into four files at 0.72, adapted functions at 0.79. The
+integration suite's fully renamed function, and the same logic rewritten in C#,
+both align at 0.8. With the floor at 0.65 that report went from 274 clusters,
+all `high`, and 29,563 removable lines to 297 clusters (5 certain, 72 high,
+133 moderate, 87 low) and 5,058 lines, with the window artefacts and shape-only
+groups gone.
 
 ## Verification
 

@@ -5,3 +5,5 @@ dist/
 models/
 duplication.config.json
 .agent
+articles
+.kiwi/

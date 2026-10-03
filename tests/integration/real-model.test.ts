@@ -2,6 +2,8 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { LocalEmbedder, cosineSimilarity } from '../../src/embedding/embedder.js';
 import { ModelStore } from '../../src/embedding/model-store.js';
 import { DEFAULT_CONFIG } from '../../src/config.js';
+import { MIN_ALIGNMENT } from '../../src/analysis/clusterer.js';
+import { alignment, contentLines } from '../../src/analysis/line-alignment.js';
 
 /**
  * Exercises the real embedding model, which has to be downloaded first:
@@ -166,5 +168,23 @@ describe('The real embedding model', () => {
     }
 
     expect(Math.sqrt(magnitude)).toBeCloseTo(1, 3);
+  });
+});
+
+describe('Line alignment on the same fixtures', () => {
+  const align = (first: string, second: string) =>
+    alignment(contentLines(first), contentLines(second));
+
+  it('A_copy_renamed_throughout_still_lines_up', () => {
+    expect(align(ORIGINAL, RENAMED)).toBeGreaterThanOrEqual(MIN_ALIGNMENT);
+  });
+
+  it('The_same_logic_in_another_language_still_lines_up', () => {
+    expect(align(ORIGINAL, SAME_LOGIC_IN_CSHARP)).toBeGreaterThanOrEqual(MIN_ALIGNMENT);
+  });
+
+  it('Code_that_only_shares_a_shape_does_not_line_up', () => {
+    expect(align(ORIGINAL, SAME_SHAPE_DIFFERENT_WORK)).toBeLessThan(MIN_ALIGNMENT);
+    expect(align(ORIGINAL, UNRELATED)).toBeLessThan(MIN_ALIGNMENT);
   });
 });
